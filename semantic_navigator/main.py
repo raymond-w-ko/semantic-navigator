@@ -137,28 +137,58 @@ def ensure_open_descriptors() -> int:
         # platforms
         return 512 - reserve
 
-async def embed(facets: Facets, directory: str) -> Cluster:
-    try:
-        repo = Repo.discover(directory)
+token_confirmation_threshold = 100
 
-        def generate_paths() -> Iterable[str]:
-            for bytestring in repo.open_index().paths():
-                path = bytestring.decode("utf-8")
+def _subdirectory(repo: Repo, directory: str) -> PurePath:
+    target = PurePath(directory)
+    repo_path = PurePath(repo.path)
 
-                subdirectory = PurePath(directory).relative_to(repo.path)
+    for candidate in [repo_path, repo_path.parent]:
+        try:
+            return target.relative_to(candidate)
+        except ValueError:
+            pass
 
-                try:
-                    relative_path = PurePath(path).relative_to(subdirectory)
+    raise ValueError(
+        f"{directory!r} is not below git repository path {repo.path!r}"
+    )
 
-                    yield str(relative_path)
-                except ValueError:
-                    pass
+def tracked_paths(directory: str) -> list[str]:
+    repo = Repo.discover(directory)
+    subdirectory = _subdirectory(repo, directory)
+    paths = [ ]
 
-    except NotGitRepository:
-        def generate_paths() -> Iterable[str]:
-            for entry in os.scandir(directory):
-                if entry.is_file(follow_symlinks = False):
-                    yield entry.path
+    for bytestring in repo.open_index().paths():
+        try:
+            path = bytestring.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+
+        try:
+            relative_path = PurePath(path).relative_to(subdirectory)
+        except ValueError:
+            continue
+
+        absolute_path = os.path.join(directory, str(relative_path))
+
+        if os.path.isfile(absolute_path):
+            paths.append(str(relative_path))
+
+    return paths
+
+def confirm_token_spend(file_count: int) -> bool:
+    if file_count < token_confirmation_threshold:
+        return True
+
+    prompt = (
+        f"This run will embed {file_count} tracked files and may burn tokens. "
+        "Continue? [y/N]: "
+    )
+    reply = input(prompt).strip().lower()
+
+    return reply in [ "y", "yes" ]
+
+async def embed(facets: Facets, directory: str, paths: Iterable[str]) -> Cluster:
 
     async def read(path) -> list[tuple[str, str]]:
         try:
@@ -200,8 +230,16 @@ async def embed(facets: Facets, directory: str) -> Cluster:
             # handled
             return [ ]
 
+        except FileNotFoundError:
+            # Ignore files that have been removed from the working tree.
+            return [ ]
+
+        except PermissionError:
+            # Ignore files that cannot be read.
+            return [ ]
+
     tasks = tqdm_asyncio.gather(
-        *(read(path) for path in generate_paths()),
+        *(read(path) for path in paths),
         desc = "Reading files",
         unit = "file",
         leave = False
@@ -673,7 +711,7 @@ def main():
         description = "Cluster documents by semantic facets",
     )
 
-    parser.add_argument("repository")
+    parser.add_argument("repository", nargs = "?", default = ".")
     parser.add_argument("--embedding-base-url")
     parser.add_argument("--completion-base-url")
     parser.add_argument("--embedding-model", default = "text-embedding-3-large")
@@ -681,6 +719,19 @@ def main():
     parser.add_argument("--completion-encoding")
     parser.add_argument("--embedding-encoding")
     arguments = parser.parse_args()
+
+    directory = os.path.abspath(arguments.repository)
+
+    try:
+        paths = tracked_paths(directory)
+    except NotGitRepository:
+        parser.error(f"{directory!r} is not a git repository directory")
+    except ValueError as error:
+        parser.error(str(error))
+
+    if not confirm_token_spend(len(paths)):
+        print("Canceled.")
+        return
 
     facets = initialize(
         arguments.embedding_model,
@@ -692,9 +743,9 @@ def main():
     )
 
     async def async_tasks():
-        initial_cluster = await embed(facets, arguments.repository)
+        initial_cluster = await embed(facets, directory, paths)
 
-        tree_ = await tree(facets, arguments.repository, initial_cluster)
+        tree_ = await tree(facets, directory, initial_cluster)
 
         return tree_
 
