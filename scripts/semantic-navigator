@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path="$(realpath "${BASH_SOURCE[0]}")"
+script_dir="$(dirname "$script_path")"
+default_source_dir="$(realpath "$script_dir/..")"
+
+source_dir="${SEMANTIC_NAVIGATOR_SOURCE:-$default_source_dir}"
+abs_source_dir="$(realpath "$source_dir")"
+key_file="${SEMANTIC_NAVIGATOR_KEY_FILE:-$HOME/.config/semantic-navigator/semantic-navigator.key}"
+
+# Load OPENAI_API_KEY from a dedicated key file if it is not already set.
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -f "$key_file" ]; then
+  key_line="$(
+    grep -v '^[[:space:]]*#' "$key_file" \
+      | sed -n '/[^[:space:]]/p' \
+      | head -n 1
+  )"
+
+  if [ -n "$key_line" ]; then
+    if [[ "$key_line" == OPENAI_API_KEY=* ]]; then
+      export OPENAI_API_KEY="${key_line#OPENAI_API_KEY=}"
+    else
+      export OPENAI_API_KEY="$key_line"
+    fi
+  fi
+fi
+
+if [ -z "${OPENAI_API_KEY:-}" ]; then
+  echo "Error: OPENAI_API_KEY is not set." >&2
+  echo "Set OPENAI_API_KEY, or place it in: $key_file" >&2
+  exit 1
+fi
+
+if [ "$#" -eq 0 ]; then
+  set -- "."
+fi
+
+exec uvx --from "$abs_source_dir" semantic-navigator "$@"
