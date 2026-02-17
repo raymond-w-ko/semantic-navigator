@@ -12,6 +12,7 @@ import platformdirs
 import psutil
 import scipy
 import sklearn
+import sqlite3
 import textual
 import textual.app
 import textual.widgets
@@ -105,6 +106,14 @@ class Embed:
     embedding: NDArray[float32]
 
 @dataclass(frozen = True)
+class EmbedInput:
+    entry: str
+    content: str
+    file_hash: str
+    input_hash: str
+    chunk_index: int
+
+@dataclass(frozen = True)
 class Cluster:
     embeds: list[Embed]
 
@@ -138,6 +147,108 @@ def ensure_open_descriptors() -> int:
         return 512 - reserve
 
 token_confirmation_threshold = 100
+
+cache_schema_version = 1
+
+def _cache_database_path() -> str:
+    cache_home = os.environ.get("XDG_CACHE_HOME")
+
+    if not cache_home:
+        cache_home = os.path.join(os.path.expanduser("~"), ".cache")
+
+    cache_directory = os.path.join(cache_home, "semantic-navigator")
+
+    os.makedirs(cache_directory, exist_ok = True)
+
+    return os.path.join(cache_directory, "cache.sqlite3")
+
+def _open_cache_connection() -> sqlite3.Connection | None:
+    try:
+        connection = sqlite3.connect(_cache_database_path())
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embedding_cache (
+                embedding_model TEXT NOT NULL,
+                input_hash      TEXT NOT NULL,
+                file_hash       TEXT NOT NULL,
+                path            TEXT NOT NULL,
+                chunk_index     INTEGER NOT NULL,
+                schema_version  INTEGER NOT NULL,
+                embedding       BLOB NOT NULL,
+                created_at      INTEGER NOT NULL DEFAULT (unixepoch()),
+                PRIMARY KEY (embedding_model, input_hash)
+            )
+            """
+        )
+
+        return connection
+    except OSError:
+        return None
+    except sqlite3.Error:
+        return None
+
+def _lookup_cached_embedding(
+    connection: sqlite3.Connection,
+    embedding_model: str,
+    input_hash: str
+) -> NDArray[float32] | None:
+    row = connection.execute(
+        """
+        SELECT embedding
+        FROM embedding_cache
+        WHERE embedding_model = ?
+          AND input_hash = ?
+          AND schema_version = ?
+        """,
+        (embedding_model, input_hash, cache_schema_version)
+    ).fetchone()
+
+    if row is None:
+        return None
+
+    try:
+        return numpy.frombuffer(row[0], dtype = float32).copy()
+    except ValueError:
+        return None
+
+def _store_cached_embeddings(
+    connection: sqlite3.Connection,
+    embedding_model: str,
+    rows: list[tuple[EmbedInput, NDArray[float32]]]
+) -> None:
+    if not rows:
+        return
+
+    connection.executemany(
+        """
+        INSERT OR REPLACE INTO embedding_cache (
+            embedding_model,
+            input_hash,
+            file_hash,
+            path,
+            chunk_index,
+            schema_version,
+            embedding
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                embedding_model,
+                input.input_hash,
+                input.file_hash,
+                input.entry,
+                input.chunk_index,
+                cache_schema_version,
+                sqlite3.Binary(embedding.tobytes())
+            )
+            for input, embedding in rows
+        ]
+    )
+
+    connection.commit()
 
 def _subdirectory(repo: Repo, directory: str) -> PurePath:
     target = PurePath(directory)
@@ -190,7 +301,7 @@ def confirm_token_spend(file_count: int) -> bool:
 
 async def embed(facets: Facets, directory: str, paths: Iterable[str]) -> Cluster:
 
-    async def read(path) -> list[tuple[str, str]]:
+    async def read(path: str) -> list[EmbedInput]:
         try:
             absolute_path = os.path.join(directory, path)
 
@@ -199,6 +310,8 @@ async def embed(facets: Facets, directory: str, paths: Iterable[str]) -> Cluster
 
                 bytestring = await handle.read()
 
+                file_hash = hashlib.sha256(bytestring).hexdigest()
+
                 text = bytestring.decode("utf-8")
 
                 prefix_tokens = facets.embedding_encoding.encode(prefix)
@@ -206,15 +319,27 @@ async def embed(facets: Facets, directory: str, paths: Iterable[str]) -> Cluster
 
                 max_tokens_per_chunk = max_tokens_per_embed - len(prefix_tokens)
 
-                return [
-                    (path, facets.embedding_encoding.decode(prefix_tokens + list(chunk)))
+                inputs = []
 
-                    # TODO: This currently only takes the first chunk because
-                    # GPT has trouble labeling chunks in order when multiple
-                    # chunks have the same file name.  Remove the `[:1]` when
-                    # this is fixed.
-                    for chunk in list(batched(text_tokens, max_tokens_per_chunk))[:1]
-                ]
+                # TODO: This currently only takes the first chunk because
+                # GPT has trouble labeling chunks in order when multiple
+                # chunks have the same file name.  Remove the `[:1]` when
+                # this is fixed.
+                for index, chunk in enumerate(list(batched(text_tokens, max_tokens_per_chunk))[:1]):
+                    content = facets.embedding_encoding.decode(prefix_tokens + list(chunk))
+                    input_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+                    inputs.append(
+                        EmbedInput(
+                            entry = path,
+                            content = content,
+                            file_hash = file_hash,
+                            input_hash = input_hash,
+                            chunk_index = index
+                        )
+                    )
+
+                return inputs
 
         except UnicodeDecodeError:
             # Ignore files that aren't UTF-8
@@ -245,37 +370,15 @@ async def embed(facets: Facets, directory: str, paths: Iterable[str]) -> Cluster
         leave = False
     )
 
-    results = list(chain.from_iterable(await tasks))
+    inputs = list(chain.from_iterable(await tasks))
 
-    if not results:
+    if not inputs:
         return Cluster([])
-
-    paths, contents = zip(*results)
-
-    cached:   dict[int, NDArray[float32]] = { }
-    uncached: dict[int, tuple[str,str]  ] = { }
-
-    for index, content in enumerate(contents):
-        bytes = f"{facets.embedding_model}{content}".encode("utf-8")
-
-        hash = hashlib.sha256(bytes).hexdigest()
-
-        cache_file = os.path.join(facets.cache_directory, f"{hash}.npy")
-
-        if os.path.exists(cache_file):
-            async with facets.semaphore:
-                cached[index] = numpy.load(cache_file)
-        else:
-            uncached[index] = (cache_file, content)
 
     max_embeds = math.floor(max_tokens_per_batch_embed / max_tokens_per_embed)
 
     @retry(retry = tenacity.retry_if_exception_type(RateLimitError), wait = tenacity.wait_fixed(1), stop = tenacity.stop_after_attempt(3))
-    async def embed_batch(items: list[tuple[int, tuple[str, str]]]) -> list[tuple[int, NDArray[float32]]]:
-        indices, pairs = zip(*items)
-
-        cache_files, input = zip(*pairs)
-
+    async def embed_batch(input: tuple[str, ...]) -> list[NDArray[float32]]:
         response = await facets.embedding_client.embeddings.create(
             model = facets.embedding_model,
             input = input
@@ -285,25 +388,62 @@ async def embed(facets: Facets, directory: str, paths: Iterable[str]) -> Cluster
             numpy.asarray(datum.embedding, float32) for datum in response.data
         ]
 
-        for cache_file, output in zip(cache_files, outputs):
-            numpy.save(cache_file, output)
+        return outputs
 
-        return list(zip(indices, outputs))
+    connection = _open_cache_connection()
+    embeddings: list[NDArray[float32] | None] = [None] * len(inputs)
+    missing_indices: list[int] = []
 
-    tasks = tqdm_asyncio.gather(
-        *(embed_batch(list(items)) for items in batched(uncached.items(), max_embeds)),
-        desc = "Embedding contents",
-        unit = "batch",
-        leave = False
-    )
+    try:
+        if connection is None:
+            missing_indices = list(range(len(inputs)))
+        else:
+            for index, input in enumerate(inputs):
+                cached_embedding = _lookup_cached_embedding(
+                    connection,
+                    facets.embedding_model,
+                    input.input_hash
+                )
 
-    computed: dict[int, NDArray[float32]] = dict(list(chain.from_iterable(await tasks)))
+                if cached_embedding is None:
+                    missing_indices.append(index)
+                else:
+                    embeddings[index] = cached_embedding
 
-    embeddings = (cached | computed).values()
+        if missing_indices:
+            contents = tuple(inputs[index].content for index in missing_indices)
+
+            tasks = tqdm_asyncio.gather(
+                *(embed_batch(input) for input in batched(contents, max_embeds)),
+                desc = "Embedding contents",
+                unit = "batch",
+                leave = False
+            )
+
+            fresh_embeddings = list(chain.from_iterable(await tasks))
+
+            for index, embedding in zip(missing_indices, fresh_embeddings):
+                embeddings[index] = embedding
+
+            if connection is not None:
+                _store_cached_embeddings(
+                    connection,
+                    facets.embedding_model,
+                    [
+                        (inputs[index], embedding)
+                        for index, embedding in zip(missing_indices, fresh_embeddings)
+                    ]
+                )
+    finally:
+        if connection is not None:
+            connection.close()
+
+    assert all(embedding is not None for embedding in embeddings)
 
     embeds = [
-        Embed(path, content, embedding)
-        for path, content, embedding in zip(paths, contents, embeddings)
+        Embed(input.entry, input.content, embedding)
+        for input, embedding in zip(inputs, embeddings)
+        if embedding is not None
     ]
 
     return Cluster(embeds)

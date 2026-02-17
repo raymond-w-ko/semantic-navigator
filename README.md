@@ -109,6 +109,14 @@ blog:
 In other words, this tool isn't just a code indexer or project indexer; it's a
 general file indexer.
 
+### Embedding cache
+
+Embeddings are cached in a SQLite database so unchanged files don't need to be
+re-embedded on every run.
+
+- Cache path: `$XDG_CACHE_HOME/semantic-navigator/cache.sqlite3`
+- Fallback path when `XDG_CACHE_HOME` is unset: `~/.cache/semantic-navigator/cache.sqlite3`
+
 ## Development
 
 If you use Nix and `direnv` this project provides a `.envrc` which
