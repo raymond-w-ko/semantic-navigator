@@ -1,21 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_path="$(realpath "${BASH_SOURCE[0]}")"
-script_dir="$(dirname "$script_path")"
-default_source_dir="$(realpath "$script_dir/..")"
-
+# Prefer the local fork checkout by default.
+default_source_dir="$HOME/src/semantic-navigator"
 source_dir="${SEMANTIC_NAVIGATOR_SOURCE:-$default_source_dir}"
-abs_source_dir="$(realpath "$source_dir")"
+
+if ! abs_source_dir="$(realpath "$source_dir" 2>/dev/null)"; then
+  echo "Error: cannot resolve semantic-navigator source path: $source_dir" >&2
+  exit 1
+fi
+
+if [ ! -f "$abs_source_dir/pyproject.toml" ]; then
+  echo "Error: source path is not a Python project: $abs_source_dir" >&2
+  echo "Set SEMANTIC_NAVIGATOR_SOURCE to your fork checkout." >&2
+  exit 1
+fi
+
 key_file="${SEMANTIC_NAVIGATOR_KEY_FILE:-$HOME/.config/semantic-navigator/semantic-navigator.key}"
 
 # Load OPENAI_API_KEY from a dedicated key file if it is not already set.
 if [ -z "${OPENAI_API_KEY:-}" ] && [ -f "$key_file" ]; then
-  key_line="$(
+  key_line="$({
     grep -v '^[[:space:]]*#' "$key_file" \
       | sed -n '/[^[:space:]]/p' \
       | head -n 1
-  )"
+  } || true)"
 
   if [ -n "$key_line" ]; then
     if [[ "$key_line" == OPENAI_API_KEY=* ]]; then
@@ -32,8 +41,24 @@ if [ -z "${OPENAI_API_KEY:-}" ]; then
   exit 1
 fi
 
-if [ "$#" -eq 0 ]; then
-  set -- "."
+# Preserve options and normalize repository argument to an absolute path.
+args=("$@")
+repo_arg="."
+
+if [ "${#args[@]}" -gt 0 ]; then
+  last_index=$((${#args[@]} - 1))
+  last_arg="${args[$last_index]}"
+
+  if [[ "$last_arg" != -* ]]; then
+    repo_arg="$last_arg"
+    unset 'args[$last_index]'
+    args=("${args[@]}")
+  fi
 fi
 
-exec uvx --from "$abs_source_dir" semantic-navigator "$@"
+if ! abs_repo_dir="$(realpath "$repo_arg" 2>/dev/null)"; then
+  echo "Error: cannot resolve repository path: $repo_arg" >&2
+  exit 1
+fi
+
+exec uvx --from "$abs_source_dir" semantic-navigator "${args[@]}" "$abs_repo_dir"
